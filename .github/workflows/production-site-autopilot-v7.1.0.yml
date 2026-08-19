@@ -27,6 +27,8 @@ jobs:
     env:
       TAG: production-site-autopilot-v7.1.0
       SOURCE_BRANCH: production-site-autopilot-v7.1.0-source
+      SOURCE_TRANSPORT: production-site-autopilot-source-v7.1.0.tar.xz
+      SOURCE_TRANSPORT_SHA256: 0641fa4096e4052c3af2deddb5d74a9d395180d43078210eeaf1de33c6633b14
       ENGINEERING_ARCHIVE: production-site-autopilot-codex-engineering-v7.1.0.zip
       USER_ARCHIVE: production-site-autopilot-codex-user-v7.1.0.zip
       ENGINEERING_SHA256: 97666e9ba94e41a7c4cd103d3023bf1fd7c243f15ef43dec96fa45822dfaaac6
@@ -43,24 +45,40 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Reconstruct engineering package
+      - name: Reconstruct and verify engineering source transport
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/package"
           cat production-site-autopilot-codex/.release-payload/v7.1.0/engineering/part-* \
             | base64 --decode \
-            > "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE"
-          printf '%s  %s\n' "$ENGINEERING_SHA256" "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE" \
+            > "$RUNNER_TEMP/package/$SOURCE_TRANSPORT"
+          printf '%s  %s\n' "$SOURCE_TRANSPORT_SHA256" "$RUNNER_TEMP/package/$SOURCE_TRANSPORT" \
             | sha256sum --check --strict
-          unzip -t "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE"
 
-      - name: Extract engineering source
+      - name: Safely extract engineering source
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/engineering"
-          unzip -q "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE" -d "$RUNNER_TEMP/engineering"
+          python - <<'PY'
+          import os
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(os.environ["RUNNER_TEMP"]) / "package" / os.environ["SOURCE_TRANSPORT"]
+          destination = Path(os.environ["RUNNER_TEMP"]) / "engineering"
+          destination.mkdir(parents=True, exist_ok=True)
+
+          with tarfile.open(archive, "r:xz") as handle:
+              for member in handle.getmembers():
+                  path = PurePosixPath(member.name)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"unsafe archive path: {member.name}")
+                  if member.issym() or member.islnk():
+                      raise SystemExit(f"archive links are not allowed: {member.name}")
+              handle.extractall(destination)
+          PY
           SOURCE_ROOT="$RUNNER_TEMP/engineering/production-site-autopilot-codex-engineering-v7.1.0"
           test -f "$SOURCE_ROOT/VERSION"
           test "$(cat "$SOURCE_ROOT/VERSION")" = "7.1.0"
@@ -73,12 +91,13 @@ jobs:
           set -euo pipefail
           python scripts/run_release_checks.py --package-root . --skip-live
 
-      - name: Rebuild and verify user edition
+      - name: Rebuild and verify both editions
         working-directory: ${{ env.SOURCE_ROOT }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/dist"
+
           python scripts/build_user_release.py --package-root . --output-dir "$RUNNER_TEMP/dist"
           python scripts/verify_user_release.py \
             --archive "$RUNNER_TEMP/dist/$USER_ARCHIVE"
@@ -86,11 +105,20 @@ jobs:
             | sha256sum --check --strict
           unzip -t "$RUNNER_TEMP/dist/$USER_ARCHIVE"
 
+          python scripts/build_release.py \
+            --package-root . \
+            --output "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE" \
+            --skip-checks
+          python scripts/verify_release.py \
+            --archive "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE"
+          printf '%s  %s\n' "$ENGINEERING_SHA256" "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE" \
+            | sha256sum --check --strict
+          unzip -t "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE"
+
       - name: Prepare release checksums
         shell: bash
         run: |
           set -euo pipefail
-          cp "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE" "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE"
           cd "$RUNNER_TEMP/dist"
           sha256sum "$USER_ARCHIVE" "$ENGINEERING_ARCHIVE" > SHA256SUMS
           cat SHA256SUMS
