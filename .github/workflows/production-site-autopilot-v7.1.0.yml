@@ -1,0 +1,148 @@
+name: Production Site Autopilot v7.1.0
+
+on:
+  pull_request:
+    paths:
+      - "production-site-autopilot-codex/**"
+      - ".github/workflows/production-site-autopilot-v7.1.0.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "production-site-autopilot-codex/**"
+      - ".github/workflows/production-site-autopilot-v7.1.0.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: production-site-autopilot-v7.1.0-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    env:
+      TAG: production-site-autopilot-v7.1.0
+      SOURCE_BRANCH: production-site-autopilot-v7.1.0-source
+      ENGINEERING_ARCHIVE: production-site-autopilot-codex-engineering-v7.1.0.zip
+      USER_ARCHIVE: production-site-autopilot-codex-user-v7.1.0.zip
+      ENGINEERING_SHA256: 97666e9ba94e41a7c4cd103d3023bf1fd7c243f15ef43dec96fa45822dfaaac6
+      USER_SHA256: 90a118d52020b2307c8447ea81ad6cd520492d255a274440adaa0cf03d257886
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Reconstruct engineering package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/package"
+          cat production-site-autopilot-codex/.release-payload/v7.1.0/engineering/part-* \
+            | base64 --decode \
+            > "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE"
+          printf '%s  %s\n' "$ENGINEERING_SHA256" "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE" \
+            | sha256sum --check --strict
+          unzip -t "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE"
+
+      - name: Extract engineering source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/engineering"
+          unzip -q "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE" -d "$RUNNER_TEMP/engineering"
+          SOURCE_ROOT="$RUNNER_TEMP/engineering/production-site-autopilot-codex-engineering-v7.1.0"
+          test -f "$SOURCE_ROOT/VERSION"
+          test "$(cat "$SOURCE_ROOT/VERSION")" = "7.1.0"
+          echo "SOURCE_ROOT=$SOURCE_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run deterministic release checks
+        working-directory: ${{ env.SOURCE_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/run_release_checks.py --package-root . --skip-live
+
+      - name: Rebuild and verify user edition
+        working-directory: ${{ env.SOURCE_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dist"
+          python scripts/build_user_release.py --package-root . --output-dir "$RUNNER_TEMP/dist"
+          python scripts/verify_user_release.py \
+            --archive "$RUNNER_TEMP/dist/$USER_ARCHIVE"
+          printf '%s  %s\n' "$USER_SHA256" "$RUNNER_TEMP/dist/$USER_ARCHIVE" \
+            | sha256sum --check --strict
+          unzip -t "$RUNNER_TEMP/dist/$USER_ARCHIVE"
+
+      - name: Prepare release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/package/$ENGINEERING_ARCHIVE" "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE"
+          cd "$RUNNER_TEMP/dist"
+          sha256sum "$USER_ARCHIVE" "$ENGINEERING_ARCHIVE" > SHA256SUMS
+          cat SHA256SUMS
+          grep -F "$USER_SHA256  $USER_ARCHIVE" SHA256SUMS
+          grep -F "$ENGINEERING_SHA256  $ENGINEERING_ARCHIVE" SHA256SUMS
+
+      - name: Publish browsable engineering source branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PUBLISH_DIR="$RUNNER_TEMP/source-publish"
+          mkdir -p "$PUBLISH_DIR"
+          cp -a "$SOURCE_ROOT"/. "$PUBLISH_DIR"/
+          cd "$PUBLISH_DIR"
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "publish: Production Site Autopilot v7.1.0 source"
+          git branch -M "$SOURCE_BRANCH"
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/$SOURCE_BRANCH"
+
+      - name: Create or update public GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSETS=(
+            "$RUNNER_TEMP/dist/$USER_ARCHIVE"
+            "$RUNNER_TEMP/dist/$ENGINEERING_ARCHIVE"
+            "$RUNNER_TEMP/dist/SHA256SUMS"
+          )
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Production Site Autopilot for Codex v7.1.0" \
+              --notes-file production-site-autopilot-codex/RELEASE_NOTES.md
+          else
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Production Site Autopilot for Codex v7.1.0" \
+              --notes-file production-site-autopilot-codex/RELEASE_NOTES.md
+          fi
